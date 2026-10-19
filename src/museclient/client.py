@@ -170,6 +170,7 @@ class Client:
         rates: dict[str, float] | None = None,
         transport: Callable[[dict, str], tuple[int, str]] | None = None,
         key: str | None = None,
+        ledger: str | Path | None = None,
     ):
         """Open a ledger and cache in ``workdir`` under an authorized cap in USD.
 
@@ -181,6 +182,9 @@ class Client:
                 read from the provider when not given.
             transport: ``(body, key) -> (status, raw)``; the OpenAI SDK by default.
             key: API key; found in the environment or config when not given.
+            ledger: Directory of per-call spend entries counted against the cap.
+                Defaults to ``workdir/ledger``; pass one directory to several
+                workdirs to hold them all under one cap.
 
         Raises:
             ValueError: If ``cap_usd`` is not positive.
@@ -193,7 +197,10 @@ class Client:
         self.root = Path(workdir)
         self.calls = self.root / "calls"
         self.calls.mkdir(parents=True, exist_ok=True)
-        self.lock_path = self.root / ".ledger.lock"
+        self.ledger = Path(ledger) if ledger else self.root / "ledger"
+        self.ledger.mkdir(parents=True, exist_ok=True)
+        self.lock_path = self.ledger / ".lock"
+        self._import_unledgered()
         self._key = key
         self.rates = rates or listed_rates(model, self.key)
 
@@ -205,10 +212,10 @@ class Client:
         return self._key
 
     def exposure(self):
-        """Reserved or reported cost of every call recorded under this workdir."""
+        """Reserved or reported cost of every call recorded in the ledger."""
         return sum(
             json.loads(p.read_text())["charged_bound_usd"]
-            for p in self.calls.glob("*/accounting.json")
+            for p in self.ledger.glob("*.json")
         )
 
     def payload(self, messages, schema, name, max_completion_tokens, reasoning_effort):
@@ -232,15 +239,25 @@ class Client:
         name="result",
         max_completion_tokens=8000,
         reasoning_effort="low",
+        key_extra=None,
+        with_call=False,
     ):
-        """The parsed, schema-valid JSON answer to ``messages``; cached by request."""
+        """The parsed, schema-valid JSON answer to ``messages``; cached by request.
+
+        ``key_extra`` is folded into the cache key and recorded, but not sent:
+        use it for deliberate repeats of an identical request (a replicate, an
+        explicit retry). With ``with_call=True`` the call's folder is returned
+        too, so a caller can keep its own derived files beside the request.
+        """
         body = self.payload(
             messages, schema, name, max_completion_tokens, reasoning_effort
         )
-        call_id = sha(canonical(body))[:24]
+        identity = {"request": body, "extra": key_extra} if key_extra else body
+        call_id = sha(canonical(identity))[:24]
         folder = self.calls / call_id
         if (folder / "answer.json").exists():
-            return json.loads((folder / "answer.json").read_text())
+            answer = json.loads((folder / "answer.json").read_text())
+            return (answer, folder) if with_call else answer
         with self.lock_path.open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             if (folder / "accounting.json").exists():
@@ -251,7 +268,7 @@ class Client:
                         "it aside so the request can be sent again"
                     )
             else:
-                self._reserve(folder, body, call_id, max_completion_tokens)
+                self._reserve(folder, body, call_id, max_completion_tokens, key_extra)
         if not (folder / "response.json").exists():
             try:
                 status, raw = self.transport(body, self.key)
@@ -259,7 +276,8 @@ class Client:
                 self._update(folder, status="unknown_outcome", error=str(error)[:300])
                 raise
             atomic_json(folder / "response.json", {"status": status, "raw": raw})
-        return self._settle(folder, schema)
+        answer = self._settle(folder, schema)
+        return (answer, folder) if with_call else answer
 
     def abandon(self, call_id):
         """Set aside a call with no response, keeping its reserve in the ledger."""
@@ -274,7 +292,7 @@ class Client:
         """Provider-reported cost of completed calls, and current exposure."""
         reported = sum(
             json.loads(p.read_text()).get("estimated_cost_usd", 0.0)
-            for p in self.calls.glob("*/accounting.json")
+            for p in self.ledger.glob("*.json")
         )
         return {
             "reported_usd": reported,
@@ -282,7 +300,7 @@ class Client:
             "cap_usd": self.cap,
         }
 
-    def _reserve(self, folder, body, call_id, max_completion_tokens):
+    def _reserve(self, folder, body, call_id, max_completion_tokens, key_extra=None):
         token_bound = len(canonical(body).encode()) + TEMPLATE_MARGIN
         if token_bound + max_completion_tokens > CONTEXT_LIMIT:
             raise ValueError("request exceeds the context limit")
@@ -299,25 +317,39 @@ class Client:
             )
         folder.mkdir(parents=True)
         atomic_json(folder / "request.json", body)
-        atomic_json(
-            folder / "accounting.json",
-            {
-                "call_id": call_id,
-                "model": self.model,
-                "rates_usd_per_million": self.rates,
-                "reserved_usd": reserve,
-                "charged_bound_usd": reserve,
-                "authorized_cap_usd": self.cap,
-                "status": "reserved",
-                "started_at": time.time(),
-            },
-        )
+        started = time.time()
+        accounting = {
+            "call_id": call_id,
+            "key_extra": key_extra,
+            "model": self.model,
+            "rates_usd_per_million": self.rates,
+            "reserved_usd": reserve,
+            "charged_bound_usd": reserve,
+            "authorized_cap_usd": self.cap,
+            "status": "reserved",
+            "started_at": started,
+            # unique per call, so an abandoned call and its retry never collide
+            "ledger_entry": sha(f"{folder.resolve()}|{started}")[:24],
+        }
+        atomic_json(folder / "accounting.json", accounting)
+        atomic_json(self.ledger / f"{accounting['ledger_entry']}.json", accounting)
+
+    def _import_unledgered(self):
+        """Give calls written before the ledger existed an entry, so they count."""
+        for path in self.calls.glob("*/accounting.json"):
+            accounting = json.loads(path.read_text())
+            if "ledger_entry" in accounting:
+                continue
+            accounting["ledger_entry"] = sha(f"{path.parent.resolve()}|imported")[:24]
+            atomic_json(path, accounting)
+            atomic_json(self.ledger / f"{accounting['ledger_entry']}.json", accounting)
 
     def _update(self, folder, **fields):
         path = folder / "accounting.json"
         accounting = json.loads(path.read_text())
         accounting.update(fields)
         atomic_json(path, accounting)
+        atomic_json(self.ledger / f"{accounting['ledger_entry']}.json", accounting)
         return accounting
 
     def _settle(self, folder, schema):

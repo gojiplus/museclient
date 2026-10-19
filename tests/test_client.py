@@ -123,3 +123,54 @@ def test_cached_tokens_are_discounted_but_the_bound_is_not():
     }
     assert usage_cost(usage, RATES) == pytest.approx(1000 * 0.002 / 1e6)
     assert usage_cost(usage, RATES, cached=False) == pytest.approx(1000 * 0.10 / 1e6)
+
+
+def test_key_extra_makes_a_deliberate_repeat_a_separate_paid_call(tmp_path):
+    calls = []
+    c = client(tmp_path, transport=fake(calls=calls))
+    c.complete(MESSAGES, SCHEMA)
+    c.complete(MESSAGES, SCHEMA, key_extra={"replicate": 1})
+    c.complete(MESSAGES, SCHEMA, key_extra={"replicate": 1})
+    assert len(calls) == 2
+    assert all("replicate" not in json.dumps(body) for body in calls)
+
+
+def test_a_shared_ledger_holds_several_workdirs_under_one_cap(tmp_path):
+    ledger = tmp_path / "ledger"
+    first = Client(
+        1.0, tmp_path / "v1", rates=RATES, key="t", transport=fake(), ledger=ledger
+    )
+    first.complete(MESSAGES, SCHEMA)
+    second = Client(
+        first.exposure() + 1e-6,
+        tmp_path / "v2",
+        rates=RATES,
+        key="t",
+        transport=fake(),
+        ledger=ledger,
+    )
+    with pytest.raises(BudgetError):
+        second.complete(MESSAGES, SCHEMA)
+
+
+def test_with_call_returns_the_folder_beside_the_answer(tmp_path):
+    c = client(tmp_path, transport=fake())
+    answer, folder = c.complete(MESSAGES, SCHEMA, with_call=True)
+    assert answer == {"label": "ok"}
+    assert (folder / "request.json").exists()
+    assert (folder / "answer.json").exists()
+
+
+def test_calls_from_before_the_ledger_still_count(tmp_path):
+    c = client(tmp_path, transport=fake())
+    c.complete(MESSAGES, SCHEMA)
+    spent = c.exposure()
+    # simulate an old workdir: per-call accounting only, no ledger
+    for p in c.ledger.glob("*.json"):
+        p.unlink()
+    for p in c.calls.glob("*/accounting.json"):
+        a = json.loads(p.read_text())
+        a.pop("ledger_entry")
+        p.write_text(json.dumps(a))
+    reopened = client(tmp_path, transport=fake())
+    assert reopened.exposure() == pytest.approx(spent)
