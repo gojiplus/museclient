@@ -6,7 +6,8 @@
   retries): part of the cache key and the record, never sent to the model.
 - A ledger directory (`ledger=`), shareable by several workdirs under one cap;
   calls written before the ledger existed are imported so they still count.
-- `complete(..., with_call=True)` returns the call folder with the answer.
+- `complete(..., with_call=True)` returns the call folder with the answer, and
+  `folder_for(...)` names it in advance, so a caller can record a failure there.
 
 - `Client(cap_usd, workdir).complete(messages, schema=...)`: structured Muse Spark
   completions through the OpenAI SDK, cached by request hash, under a hard cap

@@ -252,9 +252,8 @@ class Client:
         body = self.payload(
             messages, schema, name, max_completion_tokens, reasoning_effort
         )
-        identity = {"request": body, "extra": key_extra} if key_extra else body
-        call_id = sha(canonical(identity))[:24]
-        folder = self.calls / call_id
+        folder = self._folder(body, key_extra)
+        call_id = folder.name
         if (folder / "answer.json").exists():
             answer = json.loads((folder / "answer.json").read_text())
             return (answer, folder) if with_call else answer
@@ -278,6 +277,25 @@ class Client:
             atomic_json(folder / "response.json", {"status": status, "raw": raw})
         answer = self._settle(folder, schema)
         return (answer, folder) if with_call else answer
+
+    def folder_for(
+        self,
+        messages,
+        schema,
+        name="result",
+        max_completion_tokens=8000,
+        reasoning_effort="low",
+        key_extra=None,
+    ):
+        """Where ``complete`` with these arguments keeps its call, sent or not."""
+        body = self.payload(
+            messages, schema, name, max_completion_tokens, reasoning_effort
+        )
+        return self._folder(body, key_extra)
+
+    def _folder(self, body, key_extra):
+        identity = {"request": body, "extra": key_extra} if key_extra else body
+        return self.calls / sha(canonical(identity))[:24]
 
     def abandon(self, call_id):
         """Set aside a call with no response, keeping its reserve in the ledger."""

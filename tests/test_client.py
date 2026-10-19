@@ -174,3 +174,10 @@ def test_calls_from_before_the_ledger_still_count(tmp_path):
         p.write_text(json.dumps(a))
     reopened = client(tmp_path, transport=fake())
     assert reopened.exposure() == pytest.approx(spent)
+
+
+def test_folder_for_names_the_call_complete_uses(tmp_path):
+    c = client(tmp_path, transport=fake())
+    expected = c.folder_for(MESSAGES, SCHEMA, key_extra={"replicate": 2})
+    _, folder = c.complete(MESSAGES, SCHEMA, key_extra={"replicate": 2}, with_call=True)
+    assert folder == expected
