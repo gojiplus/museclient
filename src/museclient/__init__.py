@@ -5,7 +5,7 @@ from museclient.client import (
     BudgetError,
     Client,
     ResponseError,
-    UnknownOutcome,
+    UnknownOutcomeError,
     listed_rates,
     usage_cost,
 )
@@ -15,7 +15,7 @@ __all__ = [
     "BudgetError",
     "Client",
     "ResponseError",
-    "UnknownOutcome",
+    "UnknownOutcomeError",
     "listed_rates",
     "usage_cost",
 ]

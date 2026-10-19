@@ -32,6 +32,7 @@ import json
 import os
 import time
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -61,19 +62,22 @@ class ResponseError(ValueError):
     """The provider's response is incomplete, malformed or off-contract."""
 
 
-class UnknownOutcome(RuntimeError):
+class UnknownOutcomeError(RuntimeError):
     """The call was sent but no response arrived; it may have been charged."""
 
 
 def canonical(value):
+    """Deterministic JSON text: sorted keys, no spaces, Unicode kept."""
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def sha(text):
+    """Hex SHA-256 of a string."""
     return hashlib.sha256(text.encode()).hexdigest()
 
 
 def atomic_json(path, value):
+    """Write ``value`` as JSON via a temporary file, so a crash leaves no half file."""
     path = Path(path)
     temp = path.with_suffix(".tmp")
     temp.write_text(canonical(value) + "\n", encoding="utf-8")
@@ -95,14 +99,15 @@ def api_key():
         if found.get("api_key"):
             return found["api_key"]
     raise RuntimeError(
-        f"No Muse API key: set MUSE_API_KEY or providers.meta.api_key in {CREDENTIALS[0]}"
+        "No Muse API key: set MUSE_API_KEY or providers.meta.api_key in "
+        f"{CREDENTIALS[0]}"
     )
 
 
 def sdk_transport(body, key, timeout=TIMEOUT_SECONDS):
     """Send a chat completion through the OpenAI SDK; return (status, raw body).
 
-    Raises UnknownOutcome when the request may have reached the provider but no
+    Raises UnknownOutcomeError when the request may have reached the provider but no
     response came back.
     """
     sdk = openai.OpenAI(api_key=key, base_url=BASE_URL, max_retries=0, timeout=timeout)
@@ -111,13 +116,15 @@ def sdk_transport(body, key, timeout=TIMEOUT_SECONDS):
     except openai.APIStatusError as error:
         return error.status_code, error.response.text
     except (openai.APITimeoutError, openai.APIConnectionError) as error:
-        raise UnknownOutcome(f"{type(error).__name__}: {error}") from error
+        raise UnknownOutcomeError(f"{type(error).__name__}: {error}") from error
     return raw.http_response.status_code, raw.http_response.text
 
 
 def listed_rates(model, key):
     """USD per million tokens for input, cached input and output, as listed."""
-    response = httpx.get(MODELS_ENDPOINT, headers={"Authorization": f"Bearer {key}"}, timeout=30)
+    response = httpx.get(
+        MODELS_ENDPOINT, headers={"Authorization": f"Bearer {key}"}, timeout=30
+    )
     response.raise_for_status()
     payload = response.json()
     rows = payload.get("data", []) if isinstance(payload, dict) else payload
@@ -136,18 +143,48 @@ def listed_rates(model, key):
 def usage_cost(usage, rates, cached=True):
     """USD for a usage record; ``cached=False`` ignores the cache discount."""
     prompt, completion = usage["prompt_tokens"], usage["completion_tokens"]
-    cache = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) if cached else 0
-    if not (isinstance(prompt, int) and isinstance(completion, int) and 0 <= cache <= prompt):
+    cache = (
+        (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+        if cached
+        else 0
+    )
+    if not (
+        isinstance(prompt, int) and isinstance(completion, int) and 0 <= cache <= prompt
+    ):
         raise ResponseError(f"invalid usage: {usage}")
     return (
-        (prompt - cache) * rates["input"] + cache * rates["cached"] + completion * rates["output"]
+        (prompt - cache) * rates["input"]
+        + cache * rates["cached"]
+        + completion * rates["output"]
     ) / 1e6
 
 
 class Client:
     """Structured Muse Spark completions under a hard spending cap."""
 
-    def __init__(self, cap_usd, workdir, model=MODEL, rates=None, transport=None, key=None):
+    def __init__(
+        self,
+        cap_usd: float,
+        workdir: str | Path,
+        model: str = MODEL,
+        rates: dict[str, float] | None = None,
+        transport: Callable[[dict, str], tuple[int, str]] | None = None,
+        key: str | None = None,
+    ):
+        """Open a ledger and cache in ``workdir`` under an authorized cap in USD.
+
+        Args:
+            cap_usd: Total spend allowed across every call in ``workdir``.
+            workdir: Directory holding ``calls/`` and the ledger lock.
+            model: Model id; must appear in the provider's model listing.
+            rates: USD per million tokens (``input``, ``cached``, ``output``);
+                read from the provider when not given.
+            transport: ``(body, key) -> (status, raw)``; the OpenAI SDK by default.
+            key: API key; found in the environment or config when not given.
+
+        Raises:
+            ValueError: If ``cap_usd`` is not positive.
+        """
         if not cap_usd > 0:
             raise ValueError("a positive authorized cap is required")
         self.cap = float(cap_usd)
@@ -162,6 +199,7 @@ class Client:
 
     @property
     def key(self):
+        """The API key, looked up on first use."""
         if self._key is None:
             self._key = api_key()
         return self._key
@@ -174,6 +212,7 @@ class Client:
         )
 
     def payload(self, messages, schema, name, max_completion_tokens, reasoning_effort):
+        """The chat-completions request body for a structured answer."""
         return {
             "model": self.model,
             "store": False,
@@ -195,7 +234,9 @@ class Client:
         reasoning_effort="low",
     ):
         """The parsed, schema-valid JSON answer to ``messages``; cached by request."""
-        body = self.payload(messages, schema, name, max_completion_tokens, reasoning_effort)
+        body = self.payload(
+            messages, schema, name, max_completion_tokens, reasoning_effort
+        )
         call_id = sha(canonical(body))[:24]
         folder = self.calls / call_id
         if (folder / "answer.json").exists():
@@ -204,17 +245,17 @@ class Client:
             fcntl.flock(lock, fcntl.LOCK_EX)
             if (folder / "accounting.json").exists():
                 if not (folder / "response.json").exists():
-                    raise UnknownOutcome(
-                        f"call {call_id} was sent with no stored response and may have "
-                        f"been charged; Client.abandon('{call_id}') sets it aside so the "
-                        "request can be sent again"
+                    raise UnknownOutcomeError(
+                        f"call {call_id} was sent with no stored response and "
+                        f"may have been charged; Client.abandon('{call_id}') sets "
+                        "it aside so the request can be sent again"
                     )
             else:
                 self._reserve(folder, body, call_id, max_completion_tokens)
         if not (folder / "response.json").exists():
             try:
                 status, raw = self.transport(body, self.key)
-            except UnknownOutcome as error:
+            except UnknownOutcomeError as error:
                 self._update(folder, status="unknown_outcome", error=str(error)[:300])
                 raise
             atomic_json(folder / "response.json", {"status": status, "raw": raw})
@@ -235,7 +276,11 @@ class Client:
             json.loads(p.read_text()).get("estimated_cost_usd", 0.0)
             for p in self.calls.glob("*/accounting.json")
         )
-        return {"reported_usd": reported, "exposure_usd": self.exposure(), "cap_usd": self.cap}
+        return {
+            "reported_usd": reported,
+            "exposure_usd": self.exposure(),
+            "cap_usd": self.cap,
+        }
 
     def _reserve(self, folder, body, call_id, max_completion_tokens):
         token_bound = len(canonical(body).encode()) + TEMPLATE_MARGIN
@@ -279,7 +324,9 @@ class Client:
         stored = json.loads((folder / "response.json").read_text())
         if stored["status"] != 200:
             self._update(folder, status="failed", error=f"HTTP {stored['status']}")
-            raise ResponseError(f"provider returned HTTP {stored['status']}: {stored['raw'][:300]}")
+            raise ResponseError(
+                f"provider returned HTTP {stored['status']}: {stored['raw'][:300]}"
+            )
         response = json.loads(stored["raw"])
         usage = response["usage"]
         started = json.loads((folder / "accounting.json").read_text())["started_at"]
@@ -295,7 +342,9 @@ class Client:
         )
         choice = response["choices"][0]
         if choice.get("finish_reason") != "stop":
-            raise ResponseError(f"incomplete response: finish_reason={choice.get('finish_reason')}")
+            raise ResponseError(
+                f"incomplete response: finish_reason={choice.get('finish_reason')}"
+            )
         answer = json.loads(choice["message"]["content"])
         jsonschema.validate(answer, schema)
         atomic_json(folder / "answer.json", answer)

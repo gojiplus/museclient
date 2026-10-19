@@ -1,0 +1,29 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A manual run and a tag push can otherwise race for the same ref: two builds,
+# and two `dist` artifacts uploaded under one name.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    uses: gojiplus/py-canon/.github/workflows/reusable-release.yml@v1
+    permissions:
+      contents: write
+    with:
+      # `gh release create` fails when the release already exists, so create it
+      # only on the original tag push — not on a manual re-run of a released tag.
+      github-release: ${{ github.event_name == 'push' }}
+
+  # No PyPI: museclient is installed from GitHub
+  # (pip install "museclient @ git+https://github.com/gojiplus/museclient@vX.Y.Z").
+  # A tag builds, checks and makes a GitHub release; nothing is uploaded to PyPI.

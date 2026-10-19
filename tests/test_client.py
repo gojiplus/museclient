@@ -2,7 +2,13 @@ import json
 
 import pytest
 
-from museclient import BudgetError, Client, ResponseError, UnknownOutcome, usage_cost
+from museclient import (
+    BudgetError,
+    Client,
+    ResponseError,
+    UnknownOutcomeError,
+    usage_cost,
+)
 
 RATES = {"input": 0.10, "cached": 0.002, "output": 0.20}
 SCHEMA = {
@@ -77,24 +83,24 @@ def test_a_truncated_answer_is_rejected(tmp_path):
 
 def test_a_timed_out_call_is_kept_in_the_ledger_and_not_retried(tmp_path):
     def timed_out(body, key):
-        raise UnknownOutcome("APITimeoutError")
+        raise UnknownOutcomeError("APITimeoutError")
 
     c = client(tmp_path, transport=timed_out)
-    with pytest.raises(UnknownOutcome):
+    with pytest.raises(UnknownOutcomeError):
         c.complete(MESSAGES, SCHEMA)
     reserve = c.exposure()
     assert reserve > 0
     again = client(tmp_path, transport=fake())
-    with pytest.raises(UnknownOutcome, match="may have been charged"):
+    with pytest.raises(UnknownOutcomeError, match="may have been charged"):
         again.complete(MESSAGES, SCHEMA)
 
 
 def test_abandoning_a_call_allows_a_deliberate_retry_and_keeps_its_reserve(tmp_path):
     def timed_out(body, key):
-        raise UnknownOutcome("APITimeoutError")
+        raise UnknownOutcomeError("APITimeoutError")
 
     c = client(tmp_path, transport=timed_out)
-    with pytest.raises(UnknownOutcome):
+    with pytest.raises(UnknownOutcomeError):
         c.complete(MESSAGES, SCHEMA)
     reserve = c.exposure()
     call_id = next(p.name for p in c.calls.iterdir())
@@ -102,7 +108,8 @@ def test_abandoning_a_call_allows_a_deliberate_retry_and_keeps_its_reserve(tmp_p
     again = client(tmp_path, transport=fake())
     assert again.complete(MESSAGES, SCHEMA) == {"label": "ok"}
     statuses = sorted(
-        json.loads(p.read_text())["status"] for p in again.calls.glob("*/accounting.json")
+        json.loads(p.read_text())["status"]
+        for p in again.calls.glob("*/accounting.json")
     )
     assert statuses == ["abandoned", "valid"]
     assert again.exposure() > reserve

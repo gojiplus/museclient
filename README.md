@@ -3,6 +3,20 @@
 Cached, budget-capped calls to Meta's Muse Spark (`muse-spark-1.3-contributor` by
 default) for structured JSON answers.
 
+## Install
+
+From GitHub (not on PyPI), Python 3.12+:
+
+```sh
+uv add "museclient @ git+https://github.com/gojiplus/museclient"
+```
+
+Meta ships no client of its own and documents the OpenAI SDK pointed at
+`https://api.meta.ai/v1`; museclient sends requests that way and adds the cap,
+cache and ledger.
+
+## Use
+
 ```python
 from museclient import Client
 
@@ -28,8 +42,10 @@ What it guarantees:
 - **A hard cap.** Before sending, the call's worst case (input bytes as a token bound,
   plus all of `max_completion_tokens`) is reserved against the cap, across every call
   in the workdir. A call that would pass the cap is refused unsent.
-- **No silent paid retries.** A call that was sent but has no stored response may have
-  been charged; it is not retried until its folder is deleted.
+- **No silent paid retries.** The SDK's retries are off. A call that times out or
+  loses its connection may have been charged; it is recorded as `unknown_outcome`
+  and refused until `Client.abandon(call_id)` sets it aside, keeping its reserve in
+  the ledger.
 - **Checked answers.** A truncated response (`finish_reason != "stop"`) or one that
   fails the JSON schema raises, after its usage is recorded.
 - **Listed prices.** Rates come from the provider's model listing; the client refuses a
