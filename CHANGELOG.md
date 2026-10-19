@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Python 3.11+; only the docs build needs 3.12.
 - `key_extra` for deliberate repeats of an identical request (replicates, explicit
   retries): part of the cache key and the record, never sent to the model.
 - A ledger directory (`ledger=`), shareable by several workdirs under one cap;
