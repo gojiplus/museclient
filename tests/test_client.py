@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from museclient import BudgetError, Client, ResponseError, usage_cost
+from museclient import BudgetError, Client, ResponseError, UnknownOutcome, usage_cost
 
 RATES = {"input": 0.10, "cached": 0.002, "output": 0.20}
 SCHEMA = {
@@ -15,7 +15,7 @@ MESSAGES = [{"role": "user", "content": "say ok"}]
 
 
 def fake(answer='{"label": "ok"}', status=200, finish="stop", calls=None):
-    def transport(url, body, key):
+    def transport(body, key):
         if calls is not None:
             calls.append(body)
         response = {
@@ -75,16 +75,37 @@ def test_a_truncated_answer_is_rejected(tmp_path):
         c.complete(MESSAGES, SCHEMA)
 
 
-def test_a_sent_call_without_a_response_is_not_retried(tmp_path):
-    def broken(url, body, key):
-        raise ConnectionError("dropped")
+def test_a_timed_out_call_is_kept_in_the_ledger_and_not_retried(tmp_path):
+    def timed_out(body, key):
+        raise UnknownOutcome("APITimeoutError")
 
-    c = client(tmp_path, transport=broken)
-    with pytest.raises(ConnectionError):
+    c = client(tmp_path, transport=timed_out)
+    with pytest.raises(UnknownOutcome):
         c.complete(MESSAGES, SCHEMA)
+    reserve = c.exposure()
+    assert reserve > 0
     again = client(tmp_path, transport=fake())
-    with pytest.raises(RuntimeError, match="may have been charged"):
+    with pytest.raises(UnknownOutcome, match="may have been charged"):
         again.complete(MESSAGES, SCHEMA)
+
+
+def test_abandoning_a_call_allows_a_deliberate_retry_and_keeps_its_reserve(tmp_path):
+    def timed_out(body, key):
+        raise UnknownOutcome("APITimeoutError")
+
+    c = client(tmp_path, transport=timed_out)
+    with pytest.raises(UnknownOutcome):
+        c.complete(MESSAGES, SCHEMA)
+    reserve = c.exposure()
+    call_id = next(p.name for p in c.calls.iterdir())
+    c.abandon(call_id)
+    again = client(tmp_path, transport=fake())
+    assert again.complete(MESSAGES, SCHEMA) == {"label": "ok"}
+    statuses = sorted(
+        json.loads(p.read_text())["status"] for p in again.calls.glob("*/accounting.json")
+    )
+    assert statuses == ["abandoned", "valid"]
+    assert again.exposure() > reserve
 
 
 def test_cached_tokens_are_discounted_but_the_bound_is_not():
