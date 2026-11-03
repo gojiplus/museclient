@@ -24,7 +24,10 @@ dependencies = [
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.16.9", "pyright>=1.1.390", "pydoclint>=0.5"]
-docs = ["sphinx>=8", "furo", "myst-parser", "sphinx-copybutton", "py-canon @ git+https://github.com/gojiplus/py-canon@v1 ; python_full_version >= '3.12'"]
+docs = ["sphinx>=8", "furo", "myst-parser", "sphinx-copybutton", "py-canon @ git+https://github.com/gojiplus/py-canon@v1"]
+
+[tool.uv.dependency-groups]
+docs = { requires-python = ">=3.12" }
 
 [project.urls]
 Homepage = "https://github.com/gojiplus/museclient"
